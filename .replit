@@ -2,7 +2,7 @@ modules = ["python-3.11"]
 
 [nix]
 channel = "stable-24_05"
-packages = ["openssl", "postgresql"]
+packages = ["espeak-ng", "freetype", "glibcLocales", "openssl", "portaudio", "postgresql"]
 
 [deployment]
 deploymentTarget = "autoscale"
