@@ -1,11 +1,22 @@
-from flask import Flask, render_template_string, request, jsonify, redirect, url_for
+from flask import Flask, render_template_string, request, jsonify, redirect, url_for, Response, send_file
 import os
 import logging
 import json
+import csv
+import io
+import subprocess
 from datetime import datetime, timedelta
 from collections import deque
 import threading
 import time
+import requests
+import paho.mqtt.client as mqtt
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 # Configure logging for debugging
 logging.basicConfig(level=logging.DEBUG)
@@ -22,7 +33,16 @@ DEFAULT_CONFIG = {
     "temp_critical": 80,
     "data_retention_hours": 24,
     "log_interval": 30,
-    "auto_refresh": 5
+    "auto_refresh": 5,
+    "theme": "dark",
+    "email_alerts": True,
+    "telegram_alerts": True,
+    "mqtt_enabled": False,
+    "mqtt_broker": "localhost",
+    "mqtt_port": 1883,
+    "mqtt_topic": "raspberrypi/temperature",
+    "email_from": "alerts@raspberrypi.local",
+    "email_to": ""
 }
 
 # Load configuration
@@ -61,8 +81,27 @@ system_stats = {
     "fan_cycles": 0,
     "max_temp": 0,
     "min_temp": 100,
-    "alerts_triggered": 0
+    "alerts_triggered": 0,
+    "last_alert": None,
+    "email_alerts_sent": 0,
+    "telegram_alerts_sent": 0
 }
+
+# Alert tracking
+alert_cooldown = {}
+LOG_BUFFER = deque(maxlen=1000)
+
+# MQTT Client setup
+mqtt_client = None
+if config.get("mqtt_enabled", False):
+    try:
+        mqtt_client = mqtt.Client()
+        mqtt_client.connect(config["mqtt_broker"], config["mqtt_port"], 60)
+        mqtt_client.loop_start()
+        logging.info("MQTT client connected")
+    except Exception as e:
+        logging.error(f"MQTT connection failed: {e}")
+        mqtt_client = None
 
 # Initialize fan control with error handling
 try:
@@ -99,6 +138,18 @@ def get_cpu_temp():
         import random
         return 45 + random.uniform(-10, 25)
 
+def get_wifi_signal():
+    """Get WiFi signal strength"""
+    try:
+        result = subprocess.run(['iwconfig'], capture_output=True, text=True)
+        for line in result.stdout.split('\n'):
+            if 'Signal level' in line:
+                signal = line.split('Signal level=')[1].split(' ')[0]
+                return signal
+    except:
+        pass
+    return "Unknown"
+
 def get_system_info():
     """Get additional system information"""
     info = {}
@@ -130,16 +181,139 @@ def get_system_info():
     except:
         info['cpu_load'] = "Unknown"
     
+    # Get WiFi signal strength
+    info['wifi_signal'] = get_wifi_signal()
+    
     # Calculate app uptime
     app_uptime = datetime.now() - system_stats["uptime_start"]
     info['app_uptime'] = str(app_uptime).split('.')[0]
     
     return info
 
+def send_email_alert(subject, message):
+    """Send email alert using SendGrid"""
+    try:
+        if not config.get("email_alerts", False) or not config.get("email_to"):
+            return False
+            
+        sg = SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
+        
+        mail = Mail(
+            from_email=config.get("email_from", "alerts@raspberrypi.local"),
+            to_emails=config["email_to"],
+            subject=subject,
+            html_content=f"""
+            <h2>🚨 Raspberry Pi Alert</h2>
+            <p><strong>{subject}</strong></p>
+            <p>{message}</p>
+            <p><small>Alert sent at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small></p>
+            """
+        )
+        
+        sg.send(mail)
+        system_stats["email_alerts_sent"] += 1
+        logging.info(f"Email alert sent: {subject}")
+        return True
+    except Exception as e:
+        logging.error(f"Email alert failed: {e}")
+        return False
+
+def send_telegram_alert(message):
+    """Send Telegram alert"""
+    try:
+        if not config.get("telegram_alerts", False):
+            return False
+            
+        bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+        chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+        
+        if not bot_token or not chat_id:
+            return False
+            
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        data = {
+            "chat_id": chat_id,
+            "text": f"🚨 *Raspberry Pi Alert*\n\n{message}\n\n_Alert sent at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_",
+            "parse_mode": "Markdown"
+        }
+        
+        response = requests.post(url, data=data, timeout=10)
+        if response.status_code == 200:
+            system_stats["telegram_alerts_sent"] += 1
+            logging.info(f"Telegram alert sent: {message}")
+            return True
+        else:
+            logging.error(f"Telegram alert failed: {response.text}")
+            return False
+    except Exception as e:
+        logging.error(f"Telegram alert failed: {e}")
+        return False
+
+def publish_mqtt_data(temp, status):
+    """Publish data to MQTT broker"""
+    try:
+        if mqtt_client and config.get("mqtt_enabled", False):
+            payload = {
+                "temperature": round(temp, 2),
+                "fan_status": status,
+                "timestamp": datetime.now().isoformat(),
+                "gpio_available": GPIO_AVAILABLE
+            }
+            mqtt_client.publish(config["mqtt_topic"], json.dumps(payload))
+            logging.debug(f"MQTT data published: {payload}")
+    except Exception as e:
+        logging.error(f"MQTT publish failed: {e}")
+
+def check_and_send_alerts(temp):
+    """Check temperature and send alerts if needed"""
+    current_time = datetime.now()
+    alert_sent = False
+    
+    # Define alert conditions
+    if temp > TEMP_CRITICAL:
+        alert_type = "critical"
+        subject = "CRITICAL: Raspberry Pi Overheating!"
+        message = f"CPU temperature has reached CRITICAL level: {temp:.1f}°C (Threshold: {TEMP_CRITICAL}°C)"
+        cooldown_minutes = 5
+    elif temp > TEMP_THRESHOLD_HIGH:
+        alert_type = "high"
+        subject = "WARNING: High Raspberry Pi Temperature"
+        message = f"CPU temperature is HIGH: {temp:.1f}°C (Threshold: {TEMP_THRESHOLD_HIGH}°C)"
+        cooldown_minutes = 15
+    else:
+        return False
+    
+    # Check cooldown period
+    last_alert = alert_cooldown.get(alert_type)
+    if last_alert and (current_time - last_alert).total_seconds() < (cooldown_minutes * 60):
+        return False
+    
+    # Send alerts
+    email_sent = send_email_alert(subject, message)
+    telegram_sent = send_telegram_alert(message)
+    
+    if email_sent or telegram_sent:
+        alert_cooldown[alert_type] = current_time
+        system_stats["alerts_triggered"] += 1
+        system_stats["last_alert"] = current_time
+        alert_sent = True
+        
+        # Add to log buffer
+        LOG_BUFFER.append({
+            "timestamp": current_time.isoformat(),
+            "level": "ALERT",
+            "message": f"{alert_type.upper()}: {message}",
+            "email_sent": email_sent,
+            "telegram_sent": telegram_sent
+        })
+    
+    return alert_sent
+
 def log_temperature():
     """Log temperature data for history tracking"""
     temp = get_cpu_temp()
     timestamp = datetime.now()
+    fan_active = fan.is_active if GPIO_AVAILABLE and fan else False
     
     # Update statistics
     if temp > system_stats["max_temp"]:
@@ -151,13 +325,23 @@ def log_temperature():
     temp_history.append({
         "timestamp": timestamp.isoformat(),
         "temperature": temp,
-        "fan_active": fan.is_active if GPIO_AVAILABLE and fan else False
+        "fan_active": fan_active
     })
     
-    # Check for alerts
-    if temp > TEMP_CRITICAL:
-        system_stats["alerts_triggered"] += 1
-        logging.warning(f"CRITICAL TEMPERATURE ALERT: {temp}°C > {TEMP_CRITICAL}°C")
+    # Check and send alerts
+    check_and_send_alerts(temp)
+    
+    # Publish to MQTT
+    publish_mqtt_data(temp, "ON" if fan_active else "OFF")
+    
+    # Add to log buffer
+    LOG_BUFFER.append({
+        "timestamp": timestamp.isoformat(),
+        "level": "INFO",
+        "message": f"Temperature: {temp:.1f}°C, Fan: {'ON' if fan_active else 'OFF'}",
+        "temperature": temp,
+        "fan_status": fan_active
+    })
     
     return temp
 
@@ -168,19 +352,35 @@ def fan_status():
     return "ON" if fan.is_active else "OFF"
 
 def control_fan(temp):
-    """Control fan based on temperature threshold"""
+    """Multi-level fan control based on temperature thresholds"""
     if not GPIO_AVAILABLE or fan is None:
         logging.debug("Fan control unavailable - GPIO not initialized")
         return
     
     try:
         previous_state = fan.is_active
-        if temp > TEMP_THRESHOLD:
+        
+        # Multi-level fan control logic
+        if temp > TEMP_CRITICAL:
+            # Critical: Maximum cooling (fan always on)
             if not fan.is_active:
                 fan.on()
                 system_stats["fan_cycles"] += 1
-                logging.info(f"Fan turned ON - Temperature: {temp}°C > {TEMP_THRESHOLD}°C")
+                logging.warning(f"CRITICAL: Fan turned ON at maximum - Temperature: {temp}°C > {TEMP_CRITICAL}°C")
+        elif temp > TEMP_THRESHOLD_HIGH:
+            # High temperature: Aggressive cooling
+            if not fan.is_active:
+                fan.on()
+                system_stats["fan_cycles"] += 1
+                logging.info(f"HIGH: Fan turned ON (aggressive) - Temperature: {temp}°C > {TEMP_THRESHOLD_HIGH}°C")
+        elif temp > TEMP_THRESHOLD:
+            # Normal threshold: Standard cooling
+            if not fan.is_active:
+                fan.on()
+                system_stats["fan_cycles"] += 1
+                logging.info(f"NORMAL: Fan turned ON - Temperature: {temp}°C > {TEMP_THRESHOLD}°C")
         else:
+            # Below threshold: Turn off fan
             if fan.is_active:
                 fan.off()
                 logging.info(f"Fan turned OFF - Temperature: {temp}°C <= {TEMP_THRESHOLD}°C")
@@ -454,7 +654,13 @@ def dashboard():
             <a href="/" class="active">Dashboard</a>
             <a href="/history">History</a>
             <a href="/config">Settings</a>
+            <a href="/logs">Live Logs</a>
             <a href="/api/status">API</a>
+            <div style="margin-left: auto;">
+                <a href="/theme/{{ 'light' if config.theme == 'dark' else 'dark' }}" style="background-color: rgba(255,255,255,0.1);">
+                    {{ '☀️ Light' if config.theme == 'dark' else '🌙 Dark' }}
+                </a>
+            </div>
         </nav>
         
         <div class="container">
@@ -532,6 +738,35 @@ def dashboard():
                 <div class="info-card">
                     <div class="info-label">MEMORY USAGE</div>
                     <div class="info-value">{{ system_info.memory_usage }}</div>
+                </div>
+                <div class="info-card">
+                    <div class="info-label">WIFI SIGNAL</div>
+                    <div class="info-value">{{ system_info.wifi_signal }}</div>
+                </div>
+                <div class="info-card">
+                    <div class="info-label">EMAIL ALERTS</div>
+                    <div class="info-value">{{ system_stats.email_alerts_sent }}</div>
+                </div>
+                <div class="info-card">
+                    <div class="info-label">TELEGRAM ALERTS</div>
+                    <div class="info-value">{{ system_stats.telegram_alerts_sent }}</div>
+                </div>
+            </div>
+            
+            <div class="export-section" style="margin: 30px 0; text-align: center;">
+                <div style="margin-bottom: 15px; color: #009900; font-size: 1.2em; text-transform: uppercase;">
+                    Data Export & Reports
+                </div>
+                <div style="display: flex; gap: 15px; justify-content: center; flex-wrap: wrap;">
+                    <a href="/export/csv" style="color: #00ff00; text-decoration: none; padding: 10px 20px; border: 1px solid #003300; border-radius: 5px; background-color: rgba(0, 51, 0, 0.2); transition: all 0.3s;">
+                        📊 Export CSV
+                    </a>
+                    <a href="/export/pdf" style="color: #00ff00; text-decoration: none; padding: 10px 20px; border: 1px solid #003300; border-radius: 5px; background-color: rgba(0, 51, 0, 0.2); transition: all 0.3s;">
+                        📄 Generate PDF Report
+                    </a>
+                    <a href="/api/reset-stats" onclick="return confirm('Reset all statistics?')" style="color: #ff6600; text-decoration: none; padding: 10px 20px; border: 1px solid #663300; border-radius: 5px; background-color: rgba(255, 102, 0, 0.2); transition: all 0.3s;">
+                        🔄 Reset Stats
+                    </a>
                 </div>
             </div>
             
@@ -760,7 +995,16 @@ def configuration():
                 "temp_critical": float(request.form.get("temp_critical", config["temp_critical"])),
                 "data_retention_hours": int(request.form.get("data_retention_hours", config["data_retention_hours"])),
                 "log_interval": int(request.form.get("log_interval", config["log_interval"])),
-                "auto_refresh": int(request.form.get("auto_refresh", config["auto_refresh"]))
+                "auto_refresh": int(request.form.get("auto_refresh", config["auto_refresh"])),
+                "theme": request.form.get("theme", config.get("theme", "dark")),
+                "email_alerts": request.form.get("email_alerts") == "on",
+                "telegram_alerts": request.form.get("telegram_alerts") == "on",
+                "mqtt_enabled": request.form.get("mqtt_enabled") == "on",
+                "mqtt_broker": request.form.get("mqtt_broker", config.get("mqtt_broker", "localhost")),
+                "mqtt_port": int(request.form.get("mqtt_port", config.get("mqtt_port", 1883))),
+                "mqtt_topic": request.form.get("mqtt_topic", config.get("mqtt_topic", "raspberrypi/temperature")),
+                "email_from": request.form.get("email_from", config.get("email_from", "alerts@raspberrypi.local")),
+                "email_to": request.form.get("email_to", config.get("email_to", ""))
             }
             
             # Validate configuration
@@ -975,7 +1219,80 @@ def configuration():
                 </div>
                 
                 <div class="config-section">
+                    <div class="section-title">Alerts & Notifications</div>
+                    
+                    <div class="form-group">
+                        <label for="email_alerts">Email Alerts</label>
+                        <input type="checkbox" id="email_alerts" name="email_alerts" 
+                               {{ 'checked' if config.get('email_alerts', True) else '' }}>
+                        <div class="description">Enable email notifications for temperature alerts</div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="email_from">Email From Address</label>
+                        <input type="email" id="email_from" name="email_from" 
+                               value="{{ config.get('email_from', 'alerts@raspberrypi.local') }}">
+                        <div class="description">Sender email address for alerts</div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="email_to">Email To Address</label>
+                        <input type="email" id="email_to" name="email_to" 
+                               value="{{ config.get('email_to', '') }}">
+                        <div class="description">Recipient email address for alerts</div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="telegram_alerts">Telegram Alerts</label>
+                        <input type="checkbox" id="telegram_alerts" name="telegram_alerts" 
+                               {{ 'checked' if config.get('telegram_alerts', True) else '' }}>
+                        <div class="description">Enable Telegram notifications for temperature alerts</div>
+                    </div>
+                </div>
+                
+                <div class="config-section">
+                    <div class="section-title">MQTT Integration</div>
+                    
+                    <div class="form-group">
+                        <label for="mqtt_enabled">Enable MQTT</label>
+                        <input type="checkbox" id="mqtt_enabled" name="mqtt_enabled" 
+                               {{ 'checked' if config.get('mqtt_enabled', False) else '' }}>
+                        <div class="description">Publish temperature data to MQTT broker</div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="mqtt_broker">MQTT Broker</label>
+                        <input type="text" id="mqtt_broker" name="mqtt_broker" 
+                               value="{{ config.get('mqtt_broker', 'localhost') }}">
+                        <div class="description">MQTT broker hostname or IP address</div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="mqtt_port">MQTT Port</label>
+                        <input type="number" id="mqtt_port" name="mqtt_port" 
+                               value="{{ config.get('mqtt_port', 1883) }}" min="1" max="65535">
+                        <div class="description">MQTT broker port (usually 1883)</div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="mqtt_topic">MQTT Topic</label>
+                        <input type="text" id="mqtt_topic" name="mqtt_topic" 
+                               value="{{ config.get('mqtt_topic', 'raspberrypi/temperature') }}">
+                        <div class="description">MQTT topic for publishing temperature data</div>
+                    </div>
+                </div>
+                
+                <div class="config-section">
                     <div class="section-title">Data & Display Settings</div>
+                    
+                    <div class="form-group">
+                        <label for="theme">Theme</label>
+                        <select id="theme" name="theme" style="width: 100%; padding: 10px; border: 1px solid #003300; border-radius: 3px; background-color: #1a1a1a; color: #00ff00; font-family: 'Courier New', Courier, monospace;">
+                            <option value="dark" {{ 'selected' if config.get('theme', 'dark') == 'dark' else '' }}>Dark (Hacker)</option>
+                            <option value="light" {{ 'selected' if config.get('theme', 'dark') == 'light' else '' }}>Light</option>
+                        </select>
+                        <div class="description">Choose dashboard theme</div>
+                    </div>
                     
                     <div class="form-group">
                         <label for="data_retention_hours">Data Retention (hours)</label>
@@ -1080,6 +1397,325 @@ def reset_stats():
         "alerts_triggered": 0
     }
     return jsonify({"message": "Statistics reset successfully", "timestamp": datetime.now().isoformat()})
+
+@app.route("/export/csv")
+def export_csv():
+    """Export temperature history as CSV"""
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Write headers
+    writer.writerow(['Timestamp', 'Temperature (°C)', 'Fan Status', 'Alert Level'])
+    
+    # Write data
+    for reading in temp_history:
+        temp = reading['temperature']
+        if temp > TEMP_CRITICAL:
+            alert_level = 'CRITICAL'
+        elif temp > TEMP_THRESHOLD_HIGH:
+            alert_level = 'HIGH'
+        elif temp > TEMP_THRESHOLD:
+            alert_level = 'WARM'
+        else:
+            alert_level = 'NORMAL'
+            
+        writer.writerow([
+            reading['timestamp'],
+            round(temp, 2),
+            'ON' if reading['fan_active'] else 'OFF',
+            alert_level
+        ])
+    
+    response = Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename=raspberry_pi_temp_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'}
+    )
+    return response
+
+@app.route("/export/pdf")
+def export_pdf():
+    """Generate and download PDF report"""
+    try:
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = []
+        
+        # Title
+        title = Paragraph("Raspberry Pi Temperature Monitoring Report", styles['Title'])
+        story.append(title)
+        story.append(Spacer(1, 12))
+        
+        # Generate report content
+        current_temp = get_cpu_temp()
+        system_info = get_system_info()
+        
+        # Summary section
+        summary_data = [
+            ['Metric', 'Value'],
+            ['Current Temperature', f"{current_temp:.1f}°C"],
+            ['Fan Status', fan_status()],
+            ['Max Temperature', f"{system_stats['max_temp']:.1f}°C"],
+            ['Min Temperature', f"{system_stats['min_temp']:.1f}°C"],
+            ['Total Alerts', str(system_stats['alerts_triggered'])],
+            ['Email Alerts Sent', str(system_stats['email_alerts_sent'])],
+            ['Telegram Alerts Sent', str(system_stats['telegram_alerts_sent'])],
+            ['App Uptime', system_info['app_uptime']],
+            ['System Uptime', system_info['system_uptime']],
+            ['Memory Usage', system_info['memory_usage']],
+            ['WiFi Signal', system_info['wifi_signal']],
+        ]
+        
+        summary_table = Table(summary_data)
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 14),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        
+        story.append(Paragraph("System Summary", styles['Heading2']))
+        story.append(summary_table)
+        story.append(Spacer(1, 12))
+        
+        # Recent temperature data
+        if temp_history:
+            story.append(Paragraph("Recent Temperature Readings (Last 20)", styles['Heading2']))
+            
+            temp_data = [['Timestamp', 'Temperature', 'Fan Status']]
+            for reading in list(temp_history)[-20:]:
+                temp_data.append([
+                    reading['timestamp'][:19].replace('T', ' '),
+                    f"{reading['temperature']:.1f}°C",
+                    'ON' if reading['fan_active'] else 'OFF'
+                ])
+            
+            temp_table = Table(temp_data)
+            temp_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            
+            story.append(temp_table)
+        
+        # Build PDF
+        doc.build(story)
+        buffer.seek(0)
+        
+        return send_file(
+            io.BytesIO(buffer.read()),
+            as_attachment=True,
+            download_name=f'raspberry_pi_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf',
+            mimetype='application/pdf'
+        )
+        
+    except Exception as e:
+        logging.error(f"PDF generation failed: {e}")
+        return jsonify({"error": "PDF generation failed"}), 500
+
+@app.route("/logs")
+def live_logs():
+    """Live log viewer page"""
+    html_template = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>📋 Live System Logs</title>
+        <meta http-equiv="refresh" content="10">
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                background-color: {{ '#f5f5f5' if config.theme == 'light' else '#0f0f0f' }};
+                color: {{ '#333' if config.theme == 'light' else '#00ff00' }};
+                font-family: 'Courier New', Courier, monospace;
+                padding: 20px;
+                {% if config.theme == 'dark' %}
+                background-image: radial-gradient(circle at 1px 1px, #003300 1px, transparent 0);
+                background-size: 20px 20px;
+                {% endif %}
+            }
+            .nav {
+                display: flex;
+                justify-content: center;
+                gap: 20px;
+                margin-bottom: 30px;
+                flex-wrap: wrap;
+            }
+            .nav a {
+                color: {{ '#007bff' if config.theme == 'light' else '#00ff00' }};
+                text-decoration: none;
+                padding: 10px 20px;
+                border: 1px solid {{ '#dee2e6' if config.theme == 'light' else '#003300' }};
+                border-radius: 5px;
+                background-color: {{ '#fff' if config.theme == 'light' else 'rgba(0, 51, 0, 0.2)' }};
+                transition: all 0.3s;
+            }
+            .nav a:hover { 
+                background-color: {{ '#f8f9fa' if config.theme == 'light' else 'rgba(0, 255, 0, 0.1)' }};
+                {% if config.theme == 'dark' %}box-shadow: 0 0 10px #00ff00;{% endif %}
+            }
+            .nav a.active { 
+                background-color: {{ '#007bff' if config.theme == 'light' else 'rgba(0, 255, 0, 0.1)' }};
+                color: {{ '#fff' if config.theme == 'light' else '#00ff00' }};
+                {% if config.theme == 'dark' %}box-shadow: 0 0 10px #00ff00;{% endif %}
+            }
+            .container {
+                border: 2px solid {{ '#dee2e6' if config.theme == 'light' else '#00ff00' }};
+                border-radius: 10px;
+                padding: 30px;
+                background-color: {{ '#fff' if config.theme == 'light' else 'rgba(0, 0, 0, 0.8)' }};
+                {% if config.theme == 'dark' %}
+                box-shadow: 0 0 20px #00ff00, inset 0 0 20px rgba(0, 255, 0, 0.1);
+                {% else %}
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                {% endif %}
+                max-width: 1200px;
+                margin: 0 auto;
+            }
+            h1 {
+                font-size: 2.5em;
+                margin-bottom: 30px;
+                {% if config.theme == 'dark' %}
+                text-shadow: 0 0 15px #00ff00;
+                {% endif %}
+                text-align: center;
+            }
+            .log-container {
+                background-color: {{ '#f8f9fa' if config.theme == 'light' else '#1a1a1a' }};
+                border: 1px solid {{ '#dee2e6' if config.theme == 'light' else '#003300' }};
+                border-radius: 5px;
+                padding: 20px;
+                max-height: 600px;
+                overflow-y: auto;
+                font-family: 'Courier New', Courier, monospace;
+                font-size: 0.9em;
+            }
+            .log-entry {
+                margin: 5px 0;
+                padding: 8px;
+                border-radius: 3px;
+                border-left: 3px solid;
+            }
+            .log-info {
+                border-left-color: {{ '#28a745' if config.theme == 'light' else '#00ff00' }};
+                background-color: {{ '#d4edda' if config.theme == 'light' else 'rgba(0, 255, 0, 0.1)' }};
+            }
+            .log-alert {
+                border-left-color: {{ '#dc3545' if config.theme == 'light' else '#ff3300' }};
+                background-color: {{ '#f8d7da' if config.theme == 'light' else 'rgba(255, 51, 0, 0.1)' }};
+            }
+            .log-timestamp {
+                color: {{ '#6c757d' if config.theme == 'light' else '#999' }};
+                font-size: 0.8em;
+            }
+            .stats-row {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+                margin-bottom: 30px;
+            }
+            .stat-card {
+                padding: 15px;
+                border: 1px solid {{ '#dee2e6' if config.theme == 'light' else '#003300' }};
+                border-radius: 5px;
+                background-color: {{ '#f8f9fa' if config.theme == 'light' else 'rgba(0, 51, 0, 0.1)' }};
+                text-align: center;
+            }
+            .stat-label {
+                font-size: 0.8em;
+                color: {{ '#6c757d' if config.theme == 'light' else '#009900' }};
+                text-transform: uppercase;
+                margin-bottom: 5px;
+            }
+            .stat-value {
+                font-size: 1.2em;
+                font-weight: bold;
+                color: {{ '#007bff' if config.theme == 'light' else '#00ff00' }};
+            }
+        </style>
+    </head>
+    <body>
+        <nav class="nav">
+            <a href="/">Dashboard</a>
+            <a href="/history">History</a>
+            <a href="/config">Settings</a>
+            <a href="/logs" class="active">Live Logs</a>
+            <a href="/api/status">API</a>
+        </nav>
+        
+        <div class="container">
+            <h1>📋 LIVE SYSTEM LOGS</h1>
+            
+            <div class="stats-row">
+                <div class="stat-card">
+                    <div class="stat-label">Total Log Entries</div>
+                    <div class="stat-value">{{ logs|length }}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Alert Entries</div>
+                    <div class="stat-value">{{ alert_count }}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Last Update</div>
+                    <div class="stat-value">{{ current_time }}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Auto Refresh</div>
+                    <div class="stat-value">10s</div>
+                </div>
+            </div>
+            
+            <div class="log-container">
+                {% for log in logs[-50:] %}
+                <div class="log-entry log-{{ log.level.lower() }}">
+                    <div class="log-timestamp">{{ log.timestamp[:19].replace('T', ' ') }}</div>
+                    <div><strong>[{{ log.level }}]</strong> {{ log.message }}</div>
+                    {% if log.get('email_sent') or log.get('telegram_sent') %}
+                    <div style="font-size: 0.8em; margin-top: 5px;">
+                        Notifications: 
+                        {% if log.get('email_sent') %}📧 Email{% endif %}
+                        {% if log.get('telegram_sent') %}📱 Telegram{% endif %}
+                    </div>
+                    {% endif %}
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    alert_count = sum(1 for log in LOG_BUFFER if log.get('level') == 'ALERT')
+    
+    return render_template_string(
+        html_template,
+        logs=list(LOG_BUFFER),
+        alert_count=alert_count,
+        current_time=datetime.now().strftime('%H:%M:%S'),
+        config=config
+    )
+
+@app.route("/theme/<theme_name>")
+def switch_theme(theme_name):
+    """Switch between light and dark themes"""
+    global config
+    if theme_name in ['light', 'dark']:
+        config['theme'] = theme_name
+        save_config(config)
+    return redirect(request.referrer or url_for('dashboard'))
 
 @app.errorhandler(404)
 def not_found(error):
