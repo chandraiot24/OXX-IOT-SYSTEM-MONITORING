@@ -45,7 +45,10 @@ DEFAULT_CONFIG = {
     "mqtt_port": 1883,
     "mqtt_topic": "raspberrypi/temperature",
     "email_from": "alerts@raspberrypi.local",
-    "email_to": ""
+    "email_to": "",
+    "remote_pi_ip": "192.168.205.83",
+    "remote_pi_port": 5001,
+    "use_remote_pi": True
 }
 
 # Load configuration
@@ -149,14 +152,30 @@ except Exception as e:
     logging.error(f"GPIO initialization failed: {e}")
 
 def get_cpu_temp():
-    """Get CPU temperature from Raspberry Pi system command or simulate"""
+    """Get CPU temperature from Raspberry Pi system command or remote Pi"""
     try:
+        # Try local vcgencmd first
         temp_str = os.popen("vcgencmd measure_temp").readline()
         if temp_str and "temp=" in temp_str:
             temp = float(temp_str.replace("temp=", "").replace("'C\n", ""))
             logging.debug(f"CPU temperature: {temp}°C")
             return temp
         else:
+            # Try to get temperature from remote Raspberry Pi
+            if config.get("use_remote_pi", False):
+                try:
+                    import requests
+                    pi_ip = config.get("remote_pi_ip", "192.168.205.83")
+                    pi_port = config.get("remote_pi_port", 5001)
+                    response = requests.get(f"http://{pi_ip}:{pi_port}/api/temperature", timeout=5)
+                    if response.status_code == 200:
+                        data = response.json()
+                        temp = data.get('temperature', 0)
+                        logging.debug(f"Remote Pi CPU temperature: {temp}°C")
+                        return temp
+                except Exception as remote_e:
+                    logging.debug(f"Remote Pi connection failed: {remote_e}")
+            
             # Simulate temperature for demo purposes
             import random
             simulated_temp = 45 + random.uniform(-10, 25)
@@ -1203,7 +1222,10 @@ def configuration():
                 "mqtt_port": int(request.form.get("mqtt_port", config.get("mqtt_port", 1883))),
                 "mqtt_topic": request.form.get("mqtt_topic", config.get("mqtt_topic", "raspberrypi/temperature")),
                 "email_from": request.form.get("email_from", config.get("email_from", "alerts@raspberrypi.local")),
-                "email_to": request.form.get("email_to", config.get("email_to", ""))
+                "email_to": request.form.get("email_to", config.get("email_to", "")),
+                "remote_pi_ip": request.form.get("remote_pi_ip", config.get("remote_pi_ip", "192.168.205.83")),
+                "remote_pi_port": int(request.form.get("remote_pi_port", config.get("remote_pi_port", 5001))),
+                "use_remote_pi": request.form.get("use_remote_pi") == "on"
             }
             
             # Validate configuration
@@ -1478,6 +1500,41 @@ def configuration():
                         <input type="text" id="mqtt_topic" name="mqtt_topic" 
                                value="{{ config.get('mqtt_topic', 'raspberrypi/temperature') }}">
                         <div class="description">MQTT topic for publishing temperature data</div>
+                    </div>
+                </div>
+                
+                <div class="config-section">
+                    <div class="section-title">Remote Raspberry Pi Connection</div>
+                    
+                    <div class="form-group">
+                        <label for="use_remote_pi">Use Remote Raspberry Pi</label>
+                        <input type="checkbox" id="use_remote_pi" name="use_remote_pi" 
+                               {{ 'checked' if config.get('use_remote_pi', False) else '' }}>
+                        <div class="description">Connect to actual Raspberry Pi for real temperature data</div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="remote_pi_ip">Raspberry Pi IP Address</label>
+                        <input type="text" id="remote_pi_ip" name="remote_pi_ip" 
+                               value="{{ config.get('remote_pi_ip', '192.168.205.83') }}" 
+                               pattern="^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$">
+                        <div class="description">IP address of your Raspberry Pi (currently: 192.168.205.83)</div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="remote_pi_port">Service Port</label>
+                        <input type="number" id="remote_pi_port" name="remote_pi_port" 
+                               value="{{ config.get('remote_pi_port', 5001) }}" min="1000" max="65535">
+                        <div class="description">Port for the temperature service on your Pi</div>
+                    </div>
+                    
+                    <div style="background-color: rgba(0, 255, 255, 0.1); border: 1px solid #00ffff; padding: 15px; border-radius: 5px; margin: 15px 0;">
+                        <strong>Setup Instructions for Your Raspberry Pi:</strong><br>
+                        1. Copy the pi_service.py file to your Raspberry Pi<br>
+                        2. Install required packages: pip install flask gpiozero<br>
+                        3. Run the service: python3 pi_service.py<br>
+                        4. The service will start on port 5001<br>
+                        5. Enable the checkbox above to connect to real data
                     </div>
                 </div>
                 
