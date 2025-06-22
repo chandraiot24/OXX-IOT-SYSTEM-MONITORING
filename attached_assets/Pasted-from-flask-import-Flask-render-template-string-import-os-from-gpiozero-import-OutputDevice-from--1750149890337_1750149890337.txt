@@ -1,0 +1,76 @@
+from flask import Flask, render_template_string
+import os
+from gpiozero import OutputDevice
+from datetime import datetime
+
+app = Flask(__name__)
+
+FAN_PIN = 14
+fan = OutputDevice(FAN_PIN, initial_value=False)
+TEMP_THRESHOLD = 60  # °C
+
+def get_cpu_temp():
+    temp_str = os.popen("vcgencmd measure_temp").readline()
+    return float(temp_str.replace("temp=", "").replace("'C\n", ""))
+
+def fan_status():
+    return "ON" if fan.is_active else "OFF"
+
+@app.route("/")
+def dashboard():
+    temp = get_cpu_temp()
+
+    # Control fan automatically
+    if temp > TEMP_THRESHOLD:
+        fan.on()
+    else:
+        fan.off()
+
+    status = fan_status()
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    html = """
+    <html>
+    <head>
+        <title>🔥 Hacker Style Raspberry Pi Dashboard</title>
+        <meta http-equiv="refresh" content="5">
+        <style>
+            body {
+                background-color: #0f0f0f;
+                color: #00ff00;
+                font-family: 'Courier New', Courier, monospace;
+                text-align: center;
+                padding: 40px;
+            }
+            .temp {
+                font-size: 60px;
+                margin: 20px;
+                text-shadow: 0 0 10px #00ff00;
+            }
+            .status {
+                font-size: 48px;
+                margin: 20px;
+                font-weight: bold;
+                color: {% if status == 'ON' %}#ff3300{% else %}#00ff00{% endif %};
+                text-shadow: 0 0 20px {% if status == 'ON' %}#ff3300{% else %}#00ff00{% endif %};
+            }
+            .time {
+                font-size: 24px;
+                margin-top: 30px;
+                color: #0f0;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>🖥️ Raspberry Pi CPU Temperature & Fan Status</h1>
+        <div class="temp">CPU Temp: {{ temp }}°C</div>
+        <div class="status">Fan is: {{ status }}</div>
+        <div class="time">Time: {{ time }}</div>
+        <p>Page refreshes every 5 seconds</p>
+    </body>
+    </html>
+    """
+    return render_template_string(html, temp=temp, status=status, time=current_time)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
