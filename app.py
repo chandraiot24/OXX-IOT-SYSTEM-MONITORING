@@ -882,7 +882,7 @@ def dashboard():
         </nav>
         
         <div class="container">
-            <h1>🖥️ RASPBERRY PI SYSTEM MONITOR</h1>
+            <h1>🖥️ OXX IOT  SYSTEM MONITOR</h1>
             
             {% if not gpio_available %}
             <div class="warning">
